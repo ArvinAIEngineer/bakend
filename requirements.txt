@@ -4,3 +4,4 @@ python-dotenv
 groq
 fuzzywuzzy
 flask
+flask_cors
