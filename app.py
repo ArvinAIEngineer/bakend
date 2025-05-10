@@ -4,48 +4,53 @@ import re
 import logging
 import hashlib
 from typing import Dict, Tuple, List, Optional, Any
-import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from groq import Groq
 from fuzzywuzzy import fuzz
 from supabase import create_client, Client
-from asgiref.wsgi import WsgiToAsgi # For Uvicorn
+from asgiref.wsgi import WsgiToAsgi
+from datetime import datetime
+import google.generativeai as genai
+from PIL import Image
+import io
 
 # --- Basic Setup ---
 load_dotenv()
 app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+CORS(app)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG, # Set to INFO for production if DEBUG is too verbose
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
-    handlers=[
-        logging.StreamHandler() # Outputs logs to console
-        # You could add logging.FileHandler("app.log") here to log to a file
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
 # --- API Keys & Config ---
-NANONETS_API_KEY = os.getenv("NANONETS_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("VITE_SUPABASE_URL")
 SUPABASE_KEY = os.getenv("VITE_SUPABASE_ANON_KEY")
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile") # Default value if not set
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 FUZZY_MATCH_THRESHOLDS = {
     "name": int(os.getenv("FUZZY_NAME_THRESHOLD", "80")),
     "company": int(os.getenv("FUZZY_COMPANY_THRESHOLD", "75")),
-    "email": int(os.getenv("FUZZY_EMAIL_THRESHOLD", "95")), # Email should be a high match
-    "phone": int(os.getenv("FUZZY_PHONE_THRESHOLD", "95"))  # Phone also high match
+    "email": int(os.getenv("FUZZY_EMAIL_THRESHOLD", "95")),
+    "phone": int(os.getenv("FUZZY_PHONE_THRESHOLD", "95")),
+    "gst_number": int(os.getenv("FUZZY_GST_THRESHOLD", "90")),
+    "pan_number": int(os.getenv("FUZZY_PAN_THRESHOLD", "90")),
+    "address": int(os.getenv("FUZZY_ADDRESS_THRESHOLD", "70"))
 }
+FUZZY_MAX_RESULTS_CHAT = int(os.getenv("FUZZY_MAX_RESULTS_CHAT", "5"))
+FUZZY_MAX_RESULTS_SEARCH = int(os.getenv("FUZZY_Max_RESULTS_SEARCH", "10"))
 
 # --- Validate Environment & Initialize Clients ---
 missing_vars = []
-if not NANONETS_API_KEY: missing_vars.append("NANONETS_API_KEY")
+if not GEMINI_API_KEY: missing_vars.append("GEMINI_API_KEY")
 if not GROQ_API_KEY: missing_vars.append("GROQ_API_KEY")
 if not SUPABASE_URL: missing_vars.append("VITE_SUPABASE_URL")
 if not SUPABASE_KEY: missing_vars.append("VITE_SUPABASE_ANON_KEY")
@@ -53,6 +58,15 @@ if not SUPABASE_KEY: missing_vars.append("VITE_SUPABASE_ANON_KEY")
 if missing_vars:
     logger.warning(f"Missing environment variables: {', '.join(missing_vars)}. Some features might not work.")
 
+# Initialize Google Gemini
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    logger.info("Google Gemini client initialized successfully.")
+except Exception as e:
+    logger.error(f"Failed to initialize Google Gemini client: {e}")
+    genai = None
+
+# Initialize Groq client
 groq_client: Optional[Groq] = None
 if GROQ_API_KEY:
     try:
@@ -61,6 +75,7 @@ if GROQ_API_KEY:
     except Exception as e:
         logger.error(f"Failed to initialize Groq client: {e}")
 
+# Initialize Supabase client
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -83,132 +98,97 @@ def respond(
 def clean_phone_number(phone: Optional[str]) -> str:
     if not phone:
         return ""
-    # Keep '+' for international numbers, remove all other non-digits
     return re.sub(r'[^\d+]', '', str(phone))
 
 def clean_identifier(value: Optional[str], field_type: str = "generic") -> Optional[str]:
     if value is None:
         return None
     s_value = str(value).strip()
-    if not s_value: # If after stripping, it's an empty string
+    if not s_value:
         return None
-
     if field_type == "gst_number" or field_type == "pan_number":
-        return s_value.upper() # Ensure these are uppercase
+        return s_value.upper()
     elif field_type == "phone_number":
         return clean_phone_number(s_value)
     elif field_type == "email_address":
-        return s_value.lower() # Standardize email to lowercase
-    # For other fields like 'name', 'company', 'address', just return stripped value
+        return s_value.lower()
     return s_value
 
-# --- Text Processing Functions ---
-def extract_text_from_image(image_file) -> Tuple[Optional[str], Optional[str]]:
-    if not NANONETS_API_KEY:
-        logger.error("Nanonets API key not configured for OCR.")
-        return None, "Nanonets API key not configured"
+# --- Image Processing with Gemini ---
+def extract_entities_from_image_with_gemini(image_file) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not genai:
+        logger.error("Google Gemini client not configured.")
+        return None, "Google Gemini client not configured"
 
-    nanonets_url = "https://app.nanonets.com/api/v2/OCR/FullText"
     try:
-        logger.info(f"Sending image to Nanonets OCR: {image_file.filename}")
-        image_file.seek(0)  # Ensure stream is at the beginning
-        image_bytes = image_file.read()
-        image_file.seek(0)  # Reset stream position in case it's used again (good practice)
+        logger.info(f"Sending image to Google Gemini: {image_file.filename}")
+        image_file.seek(0)
+        image = Image.open(image_file)
+        image_file.seek(0)
 
-        # Log details about the file being sent
-        md5_hash = hashlib.md5(image_bytes).hexdigest()
-        logger.debug(f"Image details for Nanonets: filename='{image_file.filename}', size={len(image_bytes)} bytes, md5='{md5_hash}'")
+        prompt = """
+        Here is a visiting card. Extract the Name, Company, Phone, and Email of the person.
 
-        # Nanonets expects the file content type, fallback if not available
-        content_type = image_file.content_type or 'application/octet-stream' # More generic fallback
+        IMPORTANT:
+        - If an attribute is missing or unclear, OMIT it rather than including placeholders like 'Not found' or 'Unknown'.
+        - Ensure the Phone Number is formatted consistently (e.g., +1-123-456-7890 or 123-456-7890).
+        - Validate that the Email follows a standard email format (e.g., user@domain.com).
+        - Provide the output in a clean, structured JSON format with keys: name, company, phone_number, email_address.
         
-        files = {'file': (image_file.filename, image_bytes, content_type)}
-        
-        response = requests.post(
-            nanonets_url,
-            auth=requests.auth.HTTPBasicAuth(NANONETS_API_KEY, ''),
-            files=files,
-            timeout=60  # Increased timeout to 60 seconds for larger/slower OCR
+        Example Output:
+        {
+          "name": "John Doe",
+          "company": "ACME Corp",
+          "phone_number": "123-456-7890",
+          "email_address": "john@acme.com"
+        }
+        """
+
+        model = genai.GenerativeModel(
+            'gemini-1.5-flash',
+            generation_config=genai.GenerationConfig(
+                temperature=0.3,
+                max_output_tokens=512
+            )
         )
+        response = model.generate_content([prompt, image])
+        response_text = response.text
 
-        logger.debug(f"Nanonets API response status: {response.status_code}")
-        # --- ADDED DEBUG LINE FOR RAW TEXT RESPONSE ---
-        # Log the first 1000 characters of the raw text response to avoid overly long logs
-        logger.debug(f"Nanonets raw response text (first 1000 chars): {response.text[:1000]}")
-        # --- END OF ADDED DEBUG LINE ---
+        # Extract JSON from response (remove markdown if present)
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        if not json_match:
+            logger.error(f"Failed to extract JSON from Gemini response: {response_text[:100]}...")
+            return None, "Failed to parse LLM response as JSON"
 
         try:
-            response_json = response.json()
-            # Log the full Nanonets response (parsed as JSON) for thorough debugging
-            logger.debug(f"Nanonets response parsed JSON: {json.dumps(response_json, indent=2)}")
-        except json.JSONDecodeError:
-            # If it's not JSON, the raw text log above would have captured it.
-            # This error log is still useful to indicate the parsing failure.
-            logger.error(f"Nanonets API returned non-JSON response (status {response.status_code}). Raw text already logged above. Error while parsing: {response.text[:500]}")
-            return None, f"OCR service error: Invalid JSON response (status {response.status_code})"
+            extracted_data = json.loads(json_match.group(0))
+            # Clean extracted data
+            cleaned_data = {
+                "name": clean_identifier(extracted_data.get("name")),
+                "company": clean_identifier(extracted_data.get("company")),
+                "phone_number": clean_identifier(extracted_data.get("phone_number"), "phone_number"),
+                "email_address": clean_identifier(extracted_data.get("email_address"), "email_address"),
+                "gst_number": None,
+                "pan_number": None,
+                "address": None
+            }
+            logger.info(f"Gemini: Successfully extracted entities: {json.dumps(cleaned_data)}")
+            return cleaned_data, None
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in Gemini response: {e}")
+            return None, "Invalid JSON format in LLM response"
 
-        if response.status_code != 200:
-            error_message = response_json.get("message", response.text) # Prefer message from JSON if available
-            logger.error(f"Nanonets API returned status {response.status_code}: {error_message}")
-            return None, f"OCR service error: {error_message} (status {response.status_code})"
-
-        # --- TEXT EXTRACTION LOGIC ALIGNED WITH STREAMLIT ---
-        all_extracted_text_parts = []
-        def find_raw_text(obj):
-            if isinstance(obj, dict):
-                if "raw_text" in obj and isinstance(obj["raw_text"], str):
-                    all_extracted_text_parts.append(obj["raw_text"])
-                for value in obj.values():
-                    find_raw_text(value)
-            elif isinstance(obj, list):
-                for item in obj:
-                    find_raw_text(item)
-        
-        find_raw_text(response_json)
-        
-        if not all_extracted_text_parts:
-            logger.warning("No 'raw_text' field found in Nanonets JSON structure. Nanonets message: %s", response_json.get("message"))
-            nanonets_msg_detail = response_json.get("message", "No 'raw_text' field in response.")
-            if "result" in response_json and isinstance(response_json["result"], list) and not response_json["result"]:
-                nanonets_msg_detail = "Nanonets processed the image but found no text elements."
-            return "", f"No text could be extracted from the image. (Details: {nanonets_msg_detail})"
-
-        full_raw_text = "\n".join(all_extracted_text_parts).strip()
-        # -----------------------------------------------------------------
-
-        if not full_raw_text: # Check if, after joining, the text is still empty
-            logger.warning("Extracted text from Nanonets is empty after joining parts.")
-            return "", "No text content found in the image after OCR processing."
-
-        # Ensure text is UTF-8 safe
-        safe_text = full_raw_text.encode('utf-8', 'replace').decode('utf-8')
-        logger.info(f"Nanonets: Successfully extracted text (length: {len(safe_text)})")
-        return safe_text, None
-
-    except requests.exceptions.Timeout:
-        logger.error("Nanonets API request timed out.")
-        return None, "OCR request timed out. The image might be too large or the service is slow."
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Nanonets API request failed: {e}")
-        error_detail = str(e)
-        if e.response is not None:
-            try: # Try to get a more specific message from Nanonets error response
-                error_content = e.response.json()
-                error_detail = error_content.get("message", json.dumps(error_content))
-            except json.JSONDecodeError:
-                error_detail = e.response.text[:500] # Log first 500 chars of non-JSON error
-        return None, f"OCR service connection error: {error_detail}"
     except Exception as e:
-        logger.error(f"Unexpected error in Nanonets OCR processing: {e}", exc_info=True)
-        return None, f"An unexpected error occurred while processing the image with OCR: {str(e)}"
+        logger.error(f"Unexpected error in Gemini processing: {e}", exc_info=True)
+        return None, f"An unexpected error occurred during image processing: {str(e)}"
 
+# --- Text Processing Functions (Unchanged) ---
 def extract_entities_with_groq(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not groq_client:
         logger.error("Groq client not initialized, cannot extract entities.")
         return None, "Groq client not initialized"
     if not text or not text.strip():
         logger.debug("No text provided for Groq entity extraction.")
-        # Return an empty dict structure rather than None if no text, as per prompt expectation
         return {
             "name": None, "phone_number": None, "email_address": None, 
             "company": None, "gst_number": None, "pan_number": None, "address": None
@@ -216,7 +196,12 @@ def extract_entities_with_groq(text: str) -> Tuple[Optional[Dict[str, Any]], Opt
 
     logger.info(f"Sending text to Groq (model: {GROQ_MODEL}) for entity extraction (length: {len(text)})")
     system_prompt = """
-    You are an AI assistant specialized in accurately extracting specific fields from unstructured text, often from business cards, contact details, or user messages. Extract the following fields if present, mapping them to these exact JSON keys, which correspond to database columns:
+    You are an AI assistant specialized in accurately extracting specific fields from unstructured text, often from business cards, contact details, or user messages.
+    Extract the following fields if present.
+    Ensure the JSON keys in your response are *exactly* these: "name", "phone_number", "email_address", "company", "gst_number", "pan_number", "address".
+    Do not invent new keys. If a field is not present or cannot be confidently extracted, use `null` for its value.
+
+    Field definitions:
     - "name": The full name of the primary individual.
     - "phone_number": The primary phone number. Normalize by removing spaces, hyphens, parentheses, keeping only digits and a leading '+' if applicable.
     - "email_address": The primary email address, in lowercase.
@@ -225,8 +210,11 @@ def extract_entities_with_groq(text: str) -> Tuple[Optional[Dict[str, Any]], Opt
     - "pan_number": The Permanent Account Number (PAN), in uppercase.
     - "address": The full mailing address, combined into a single string if multi-line.
 
-    Return ONLY a valid JSON object containing these fields. Use null for fields that are not found or cannot be confidently extracted. Prioritize accuracy. Clean up common prefixes like 'Tel:', 'Email:', 'GSTIN:', 'PAN No.:', etc. If multiple phone numbers or emails are present, select the primary one based on context.
-    For example, if the text is "Meet John Doe of ACME Corp, GST 123, PAN ABC, call 9999988888 or email john@acme.com", the output should be:
+    Return ONLY a valid JSON object containing these fields. Prioritize accuracy. Clean up common prefixes like 'Tel:', 'Email:', 'GSTIN:', 'PAN No.:', etc.
+    If multiple phone numbers or emails are present, select the primary one based on context.
+
+    Example Input: "Meet John Doe of ACME Corp, GST 123, PAN ABC, call 9999988888 or email john@acme.com"
+    Example Output:
     {
         "name": "John Doe",
         "phone_number": "9999988888",
@@ -236,7 +224,8 @@ def extract_entities_with_groq(text: str) -> Tuple[Optional[Dict[str, Any]], Opt
         "pan_number": "ABC",
         "address": null
     }
-    If the text is empty or contains no extractable entities, return:
+
+    Example for empty or non-extractable text:
     {
         "name": null,
         "phone_number": null,
@@ -254,20 +243,19 @@ def extract_entities_with_groq(text: str) -> Tuple[Optional[Dict[str, Any]], Opt
                 {"role": "user", "content": text}
             ],
             model=GROQ_MODEL,
-            temperature=0.1, # Low temperature for factual extraction
-            max_tokens=1500, # Sufficient for JSON output
-            response_format={"type": "json_object"} # Request JSON output
+            temperature=0.1,
+            max_tokens=1500,
+            response_format={"type": "json_object"}
         )
         result_content = chat_completion.choices[0].message.content
         logger.debug(f"Groq raw response: {result_content}")
         extracted_data_raw = json.loads(result_content)
 
-        # Clean the extracted data
         cleaned_data: Dict[str, Optional[str]] = {}
         expected_keys = ['name', 'phone_number', 'email_address', 'company', 'gst_number', 'pan_number', 'address']
 
         for key in expected_keys:
-            raw_value = extracted_data_raw.get(key) # Use .get() to handle missing keys gracefully
+            raw_value = extracted_data_raw.get(key)
             cleaned_data[key] = clean_identifier(raw_value, key)
 
         logger.info(f"Groq: Successfully extracted and cleaned structured data: {json.dumps(cleaned_data)}")
@@ -280,49 +268,35 @@ def extract_entities_with_groq(text: str) -> Tuple[Optional[Dict[str, Any]], Opt
         logger.error(f"Groq: Error in entity extraction: {e}", exc_info=True)
         return None, f"LLM entity extraction failed: {str(e)}"
 
-# --- Database Operations ---
-def get_all_customers() -> List[Dict[str, Any]]: # Not async, Supabase Python client is sync by default
+# --- Database Operations (Unchanged) ---
+def get_all_customers() -> List[Dict[str, Any]]:
     if not supabase:
         logger.error("Supabase client not available for get_all_customers")
         return []
     try:
         response = supabase.table('customers').select(
-            'id, name, phone_number, email_address, company, gst_number, pan_number, address' # Specify columns
-        ).order('name').execute() # Order by name for consistency
-        
-        # Supabase client v1.x returns PostgrestAPIResponse, .data is the list
-        # Supabase client v2.x might change this, check documentation if upgrading
+            'id, name, phone_number, email_address, company, gst_number, pan_number, address, created_at'
+        ).order('name').execute()
         return response.data if hasattr(response, 'data') else []
     except Exception as e:
         logger.error(f"Supabase: Failed to fetch all customers: {e}", exc_info=True)
         return []
 
-async def search_customers_in_db(query_term: str) -> List[Dict[str, Any]]:
+async def search_customers_in_db(query_term: str, for_chat: bool = False) -> List[Dict[str, Any]]:
     if not supabase:
         logger.error("Supabase client not available for search_customers_in_db")
         return []
     
-    logger.info(f"Supabase: Searching for customers with query: '{query_term}'")
+    logger.info(f"Supabase: Searching for customers with query: '{query_term}' (for_chat: {for_chat})")
     
-    # Clean query terms for specific fields
-    clean_query_gst = clean_identifier(query_term, "gst_number")
-    clean_query_pan = clean_identifier(query_term, "pan_number")
-    clean_query_email = clean_identifier(query_term, "email_address")
-    # For phone, we need to be careful as DB might not store it normalized
-    # We'll do an exact match on cleaned phone later if other searches fail.
-    # For now, use the raw query_term for phone if it looks like one, or do a broader search.
+    all_results: Dict[int, Dict[str, Any]] = {}
 
-    all_results: Dict[int, Dict[str, Any]] = {} # Use dict to avoid duplicates by ID
-
-    # Helper for executing Supabase queries
-    # Supabase Python client's execute() is blocking, so no `await` needed directly on it
-    # The `async def` is for Flask's async route handling, not for Supabase client calls.
     def execute_and_store_sync(field_name, value_to_match, match_type="eq"):
         if not value_to_match: return
         try:
             if match_type == "ilike":
                 db_response = supabase.table('customers').select('*').ilike(field_name, f'%{value_to_match}%').execute()
-            else: # eq
+            else:
                 db_response = supabase.table('customers').select('*').eq(field_name, value_to_match).execute()
             
             if db_response.data:
@@ -331,54 +305,56 @@ async def search_customers_in_db(query_term: str) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.error(f"Supabase: Error searching by {field_name} for '{value_to_match}': {e}")
 
-    # Exact matches first (more reliable)
+    clean_query_gst = clean_identifier(query_term, "gst_number")
+    clean_query_pan = clean_identifier(query_term, "pan_number")
+    clean_query_email = clean_identifier(query_term, "email_address")
+    
     if clean_query_gst: execute_and_store_sync('gst_number', clean_query_gst)
     if not all_results and clean_query_pan: execute_and_store_sync('pan_number', clean_query_pan)
-    # Email match (case-insensitive exact usually best)
-    if not all_results and clean_query_email: execute_and_store_sync('email_address', clean_query_email, match_type="eq") # use eq for email after cleaning
+    if not all_results and clean_query_email: execute_and_store_sync('email_address', clean_query_email)
 
-    # Phone number search: requires client-side normalization and comparison
-    # as DB might store phones with varied formatting.
     clean_query_phone = clean_phone_number(query_term)
     if not all_results and clean_query_phone:
-        all_cust_for_phone = get_all_customers() # This is a sync call
+        logger.warning("PERFORMANCE_ALERT: Fetching all customers for client-side phone normalization in search_customers_in_db.")
+        all_cust_for_phone = get_all_customers()
         for cust in all_cust_for_phone:
             db_phone_cleaned = clean_phone_number(cust.get('phone_number'))
             if db_phone_cleaned and db_phone_cleaned == clean_query_phone:
                 all_results[cust['id']] = cust
-                logger.info(f"Supabase: Found by normalized phone client-side for '{query_term}' matching '{clean_query_phone}'")
-                # break # Found one, usually phone is unique enough (removed break to catch all matches)
+                logger.info(f"Supabase: Found by client-side normalized phone for '{query_term}'")
 
-    # Broader ilike searches if no exact matches found
     if not all_results: execute_and_store_sync('name', query_term, match_type="ilike")
     if not all_results: execute_and_store_sync('company', query_term, match_type="ilike")
-    # Broader email search if exact email didn't match
-    if not all_results and clean_query_email: execute_and_store_sync('email_address', clean_query_email, match_type="ilike") 
 
-
-    # Fuzzy matching as a last resort if still no results and query is reasonably long
     if not all_results and len(query_term) > 2:
-        logger.info(f"Supabase: No exact/ilike matches for '{query_term}', trying fuzzy on all customers.")
-        all_customers_for_fuzzy = get_all_customers() # Sync call
+        logger.warning("PERFORMANCE_ALERT: Fetching all customers for client-side fuzzy matching in search_customers_in_db.")
+        all_customers_for_fuzzy = get_all_customers()
         fuzzy_scored_matches = []
+        fields_to_fuzzy_match = ['name', 'company', 'email_address', 'phone_number', 'gst_number', 'pan_number', 'address']
+
         for cust in all_customers_for_fuzzy:
-            # Score against multiple fields
-            name_score = fuzz.token_set_ratio(query_term.lower(), (cust.get('name') or "").lower())
-            company_score = fuzz.token_set_ratio(query_term.lower(), (cust.get('company') or "").lower())
-            
-            # Prioritize name matches for general queries
-            if name_score > FUZZY_MATCH_THRESHOLDS["name"]:
-                fuzzy_scored_matches.append((name_score, cust))
-            elif company_score > FUZZY_MATCH_THRESHOLDS["company"]:
-                 fuzzy_scored_matches.append((company_score, cust)) # Could use a slightly lower threshold for company
+            max_score = 0
+            matched_field = None
+            for field in fields_to_fuzzy_match:
+                db_value = cust.get(field) or ""
+                if not db_value: continue
+                threshold_key = 'phone' if field == 'phone_number' else 'email' if field == 'email_address' else field
+                threshold = FUZZY_MATCH_THRESHOLDS.get(threshold_key, 75)
+                score = fuzz.token_set_ratio(query_term.lower(), str(db_value).lower())
+                if score > max_score and score >= threshold:
+                    max_score = score
+                    matched_field = field
+            if max_score >= FUZZY_MATCH_THRESHOLDS.get(matched_field or 'name', 75):
+                fuzzy_scored_matches.append((max_score, cust))
 
         if fuzzy_scored_matches:
-            fuzzy_scored_matches.sort(key=lambda x: x[0], reverse=True) # Sort by score desc
-            for score, cust in fuzzy_scored_matches[:5]: # Take top 5 fuzzy matches
-                 if cust['id'] not in all_results: # Add if not already found
+            fuzzy_scored_matches.sort(key=lambda x: x[0], reverse=True)
+            max_results_for_this_search = FUZZY_MAX_RESULTS_CHAT if for_chat else FUZZY_MAX_RESULTS_SEARCH
+            for score, cust in fuzzy_scored_matches[:max_results_for_this_search]:
+                if cust['id'] not in all_results:
                     all_results[cust['id']] = cust
-            logger.info(f"Supabase: Added up to {min(5, len(fuzzy_scored_matches))} fuzzy matches for '{query_term}'")
-            
+            logger.info(f"Supabase: Added up to {min(max_results_for_this_search, len(fuzzy_scored_matches))} fuzzy matches for '{query_term}'")
+
     return list(all_results.values())
 
 async def find_matching_customer_in_db(extracted_entities: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]]]:
@@ -387,62 +363,52 @@ async def find_matching_customer_in_db(extracted_entities: Dict[str, Any]) -> Tu
         return False, None
     logger.info(f"Supabase: Finding match for extracted entities: {json.dumps(extracted_entities)}")
 
-    # Check for exact matches on unique identifiers first
     unique_checks = [
         ('gst_number', clean_identifier(extracted_entities.get('gst_number'), 'gst_number')),
         ('pan_number', clean_identifier(extracted_entities.get('pan_number'), 'pan_number')),
         ('email_address', clean_identifier(extracted_entities.get('email_address'), 'email_address')),
     ]
     for field, value in unique_checks:
-        if value: # Only query if value is not None/empty after cleaning
+        if value:
             try:
-                op = 'eq' # Use 'eq' for exact matches
-                # For email, Supabase stores it as text, so 'eq' on the cleaned lowercase value is appropriate.
-                # If DB stores mixed case emails, then 'ilike' would be needed, but we clean to lowercase.
-                
-                response = supabase.table('customers').select('*').filter(field, op, value).limit(1).execute()
+                response = supabase.table('customers').select('*').eq(field, value).limit(1).execute()
                 if response.data:
                     logger.info(f"Supabase: Exact match found on '{field}' for value '{value}'")
                     return True, response.data[0]
             except Exception as e:
                 logger.error(f"Supabase: Error checking exact match for {field}='{value}': {e}")
 
-    # Check for phone number match (requires normalization)
     ex_phone_clean = clean_identifier(extracted_entities.get('phone_number'), 'phone_number')
     if ex_phone_clean:
-        all_customers = get_all_customers() # Sync call
+        logger.warning("PERFORMANCE_ALERT: Fetching all customers for client-side phone normalization in find_matching_customer_in_db.")
+        all_customers = get_all_customers()
         for customer in all_customers:
             db_phone_clean = clean_phone_number(customer.get('phone_number'))
             if db_phone_clean and db_phone_clean == ex_phone_clean:
                 logger.info(f"Supabase: Exact normalized phone match found for '{ex_phone_clean}'")
                 return True, customer
 
-    # Fuzzy matching if no exact match is found
-    all_customers_for_fuzzy = get_all_customers() # Sync call
+    logger.warning("PERFORMANCE_ALERT: Fetching all customers for client-side fuzzy matching in find_matching_customer_in_db.")
+    all_customers_for_fuzzy = get_all_customers()
     if not all_customers_for_fuzzy:
         logger.info("Supabase: No customers found in database for fuzzy matching.")
         return False, None
 
-    fuzzy_fields = ['name', 'company'] 
-
+    fuzzy_fields = ['name', 'company', 'email_address', 'phone_number', 'gst_number', 'pan_number', 'address']
     for field in fuzzy_fields:
-        ex_value = clean_identifier(extracted_entities.get(field)) 
-        if not ex_value:
-            continue 
+        ex_value = clean_identifier(extracted_entities.get(field))
+        if not ex_value: continue
         
         ex_value_lower = ex_value.lower()
-
         for customer in all_customers_for_fuzzy:
-            db_value = customer.get(field) or "" 
-            if not db_value:
-                continue 
-
-            score = fuzz.token_set_ratio(ex_value_lower, db_value.lower())
-            threshold = FUZZY_MATCH_THRESHOLDS.get(field, 75) 
-            
+            db_value = customer.get(field) or ""
+            if not db_value: continue
+            threshold_key = 'phone' if field == 'phone_number' else 'email' if field == 'email_address' else field
+            threshold = FUZZY_MATCH_THRESHOLDS.get(threshold_key, 75)
+            score = fuzz.token_set_ratio(ex_value_lower, str(db_value).lower())
             if score >= threshold:
-                logger.info(f"Supabase: Fuzzy match found on '{field}' for '{ex_value}' with score {score} (threshold {threshold}) (customer: {customer.get('name')})")
-                return True, customer 
+                logger.info(f"Supabase: Fuzzy match found on '{field}' for '{ex_value}' (score {score})")
+                return True, customer
 
     logger.info("Supabase: No sufficiently strong unique or fuzzy match found.")
     return False, None
@@ -458,53 +424,68 @@ async def add_customer_to_db(customer_data: Dict[str, Any]) -> Dict[str, Any]:
     valid_supabase_columns = ['name', 'phone_number', 'email_address', 'company', 'gst_number', 'pan_number', 'address']
     for col in valid_supabase_columns:
         raw_value = customer_data.get(col)
-        data_to_insert[col] = clean_identifier(raw_value, col) 
+        data_to_insert[col] = clean_identifier(raw_value, col)
 
     if not data_to_insert.get('name'):
         logger.warning("Supabase: Add customer failed - 'name' is missing or empty after cleaning.")
         return {"status": "error", "message": "Customer name is required and cannot be empty."}
 
     try:
-        response = supabase.table('customers').insert(data_to_insert).execute()
+        response = supabase.table('customers').insert(data_to_insert).select().execute()
 
         if response.data and len(response.data) > 0:
             new_customer_record = response.data[0]
             logger.info(f"Supabase: Successfully added customer ID {new_customer_record.get('id')}: {new_customer_record.get('name')}")
             return {"status": "success", "message": "Customer added successfully.", "customer_data": new_customer_record}
         else:
-            error_info = getattr(response, 'error', None) 
-            if error_info: 
-                logger.error(f"Supabase: Insert failed with Supabase error: {error_info}")
-                msg = error_info.message if hasattr(error_info, 'message') else str(error_info)
-                
+            error_info = getattr(response, 'error', None)
+            if error_info and hasattr(error_info, 'message'):
+                msg = error_info.message
+                logger.error(f"Supabase: Insert failed with Supabase error: {msg}")
                 if "duplicate key value violates unique constraint" in msg.lower():
-                    field_match = re.search(r"constraint \"customers_(\w+)_key\"", msg) 
-                    field = field_match.group(1).replace('_', ' ') if field_match else "a unique field (e.g., GST, PAN, Email)"
+                    field_match = re.search(r"constraint \"customers_(\w+)_key\"", msg)
+                    field = field_match.group(1).replace('_', ' ') if field_match else "a unique field"
                     return {"status": "error", "message": f"A customer with this {field} already exists."}
                 return {"status": "error", "message": f"Database error: {msg}"}
             
-            logger.warning(f"Supabase: Insert command executed but no data returned and no explicit error. Response: {response}")
-            return {"status": "error", "message": "Customer may have been added, but confirmation from database failed."}
+            logger.warning(f"Supabase: Insert command executed but no data or explicit error. Response: {response}")
+            return {"status": "error", "message": "Customer addition failed. No specific error from DB."}
 
-    except Exception as e: 
+    except Exception as e:
         logger.error(f"Supabase: Exception during customer insertion: {e}", exc_info=True)
-        if "duplicate key value violates unique constraint" in str(e).lower():
-             field_match = re.search(r"constraint \"customers_(\w+)_key\"", str(e))
-             field = field_match.group(1).replace('_', ' ') if field_match else "a unique field"
-             return {"status": "error", "message": f"A customer with this {field} already exists (from exception)."}
-        return {"status": "error", "message": f"Failed to add customer due to a server error: {str(e)}"}
+        err_str = str(e).lower()
+        if "duplicate key value violates unique constraint" in err_str:
+            field_match = re.search(r"constraint \"customers_(\w+)_key\"", err_str)
+            field = field_match.group(1).replace('_', ' ') if field_match else "a unique field"
+            return {"status": "error", "message": f"A customer with this {field} already exists."}
+        return {"status": "error", "message": f"Failed to add customer: {str(e)}"}
 
-# --- API Routes (Async for Flask if using an ASGI server like Uvicorn) ---
+# --- API Routes ---
+def format_customer_details_for_chat(customer: Dict[str, Any]) -> str:
+    details = []
+    fields_order = ['name', 'company', 'gst_number', 'pan_number', 'email_address', 'phone_number', 'address', 'id', 'created_at']
+    for field in fields_order:
+        value = customer.get(field)
+        if value:
+            if field == 'created_at' and isinstance(value, str):
+                try:
+                    value_dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    value = value_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+                except ValueError:
+                    pass
+            details.append(f"• {field.replace('_', ' ').title()}: {value}")
+    return "\n".join(details) if details else "No details available."
+
 @app.route('/api/chat', methods=['POST'])
 async def handle_chat_route():
     if not request.is_json:
-        return respond("Request must be JSON", "error", 415) # Unsupported Media Type
+        return respond("Request must be JSON", "error", 415)
     
     data = request.json
     user_message = data.get('message', '').strip()
 
     if not user_message:
-        return respond("No message provided", "error", 400) # Bad Request
+        return respond("No message provided", "error", 400)
 
     logger.info(f"Chat: Received message: '{user_message}'")
 
@@ -520,50 +501,50 @@ async def handle_chat_route():
     search_match = re.match(r"(?:find|search|lookup|get|show)\s+(?:customer|client|contact|details\s+for)?\s*(.+)", user_message, re.IGNORECASE)
     if search_match:
         query = search_match.group(1).strip()
-        if not query: 
-            return respond("Please specify who or what you are looking for (e.g., name, GST, email).", status="query_missing", code=400)
+        if not query:
+            return respond("Please specify what you're looking for.", status="query_missing", code=400)
         
-        logger.info(f"Chat: Search intent identified. Query: '{query}'")
+        logger.info(f"Chat: Search intent. Query: '{query}'")
         try:
-            found_customers = await search_customers_in_db(query)
+            found_customers = await search_customers_in_db(query, for_chat=True)
         except Exception as e:
             logger.error(f"Chat: Error calling search_customers_in_db: {e}", exc_info=True)
-            return respond("An error occurred while searching for customers.", "error", 500)
+            return respond("Error searching customers.", "error", 500)
 
         if not found_customers:
-            return respond(f"I couldn't find any customers matching '{query}'. You can try different details or add them as a new customer.", status="not_found")
+            return respond(f"I couldn't find customers matching '{query}'. Add them or try different details.", status="not_found")
         if len(found_customers) == 1:
             cust = found_customers[0]
-            details_str = f"Name: {cust.get('name', 'N/A')}\n" \
-                          f"Company: {cust.get('company', 'N/A')}\n" \
-                          f"GST: {cust.get('gst_number', 'N/A')}\n" \
-                          f"PAN: {cust.get('pan_number', 'N/A')}\n" \
-                          f"Email: {cust.get('email_address', 'N/A')}\n" \
-                          f"Phone: {cust.get('phone_number', 'N/A')}\n" \
-                          f"Address: {cust.get('address', 'N/A')}"
+            details_str = format_customer_details_for_chat(cust)
             return respond(
                 f"Found customer:\n{details_str}",
                 status="found_single", customer_data=cust
             )
-        else: 
-            names = [f"• {c.get('name', 'Unknown')} (Company: {c.get('company', 'N/A')}, GST: {c.get('gst_number', 'N/A')})" for c in found_customers[:5]] 
+        else:
+            response_message = f"Found multiple potential matches for '{query}':\n"
+            for i, c in enumerate(found_customers):
+                response_message += (
+                    f"{i+1}. {c.get('name', 'N/A')} "
+                    f"(Company: {c.get('company', 'N/A')}, GST: {c.get('gst_number', 'N/A')})\n"
+                )
+            response_message += "\nPlease be more specific, or ask for details by number (e.g., 'show details for 1')."
             return respond(
-                f"Found multiple potential matches for '{query}':\n" + "\n".join(names) + "\n\nPlease be more specific or provide more details.",
-                status="found_multiple", customer_data=found_customers[:5] 
+                response_message,
+                status="found_multiple", customer_data=found_customers
             )
 
-    logger.info(f"Chat: No simple search intent, using LLM for entity extraction from: '{user_message}'")
+    logger.info(f"Chat: No simple search, using LLM for entity extraction: '{user_message}'")
     try:
         extracted_entities, extraction_error = extract_entities_with_groq(user_message)
     except Exception as e:
         logger.error(f"Chat: Error calling extract_entities_with_groq: {e}", exc_info=True)
-        return respond("There was an issue processing your message with the AI model.", "error", 500)
+        return respond("Issue processing message with AI.", "error", 500)
 
     if extraction_error:
-        return respond(f"Sorry, I had trouble understanding the details: {extraction_error}", status="extraction_error", code=400 if "No text" in extraction_error else 500)
+        return respond(f"Understanding error: {extraction_error}", status="extraction_error", code=400 if "No text" in extraction_error else 500)
     
-    if not extracted_entities or not any(v for v in extracted_entities.values()): 
-        return respond("I couldn't extract specific customer details from your message. Could you try rephrasing or providing more information?", status="extraction_failed")
+    if not extracted_entities or not any(v for v in extracted_entities.values()):
+        return respond("Couldn't extract customer details. Try rephrasing.", status="extraction_failed")
 
     logger.info(f"Chat: LLM extracted: {json.dumps(extracted_entities)}")
     
@@ -571,130 +552,62 @@ async def handle_chat_route():
         match_found, existing_customer_data = await find_matching_customer_in_db(extracted_entities)
     except Exception as e:
         logger.error(f"Chat: Error calling find_matching_customer_in_db: {e}", exc_info=True)
-        return respond("An error occurred while checking against the existing customer database.", "error", 500)
+        return respond("Error checking database.", "error", 500)
 
     if match_found and existing_customer_data:
-        details_str = f"Name: {existing_customer_data.get('name', 'N/A')}\n" \
-                      f"Company: {existing_customer_data.get('company', 'N/A')}\n" \
-                      f"GST: {existing_customer_data.get('gst_number', 'N/A')}"
+        details_str = format_customer_details_for_chat(existing_customer_data)
         return respond(
-            f"This looks like an existing customer: {details_str}.\nIs this the correct one, or would you like to add a new entry with the details you provided?",
-            status="existing_customer_chat", 
-            customer_data=existing_customer_data, 
-            extracted_data=extracted_entities 
+            f"This looks like an existing customer:\n{details_str}\n\nIs this correct, or add new?",
+            status="existing_customer_chat",
+            customer_data=existing_customer_data,
+            extracted_data=extracted_entities
         )
     else:
         details_summary = "\n".join([f"  • {key.replace('_', ' ').title()}: {value}" for key, value in extracted_entities.items() if value])
         return respond(
-            f"I've extracted these details from your message:\n{details_summary}\n\nThis seems to be a new customer. Would you like me to add them, or would you like to use the form to confirm/edit?",
-            status="new_potential_chat", 
+            f"Extracted details:\n{details_summary}\n\nThis seems new. Add them or use form?",
+            status="new_potential_chat",
             extracted_data=extracted_entities
         )
 
 @app.route('/api/upload-card', methods=['POST'])
 async def handle_card_upload_route():
     if 'card' not in request.files:
-        logger.error("CardUpload: 'card' file part missing in request.")
-        return respond("No 'card' file part in the request.", "error", 400)
+        return respond("No 'card' file part.", "error", 400)
     
     file = request.files['card']
     if file.filename == '':
-        logger.error("CardUpload: No file selected for upload (empty filename).")
-        return respond("No file selected for upload.", "error", 400)
-
-    if not file: 
-        logger.error("CardUpload: File object is None.")
-        return respond("File not provided correctly.", "error", 400)
+        return respond("No file selected.", "error", 400)
+    if not file:
+        return respond("File not provided.", "error", 400)
         
-    logger.info(f"CardUpload: Received card for processing: {file.filename}")
-
-    raw_text = "" # Initialize raw_text
-    extracted_entities = {} # Initialize extracted_entities
+    logger.info(f"CardUpload: Received card: {file.filename}")
 
     try:
-        # 1. Extract text from image using Nanonets
-        raw_text, ocr_error = extract_text_from_image(file)
+        extracted_entities, error = extract_entities_from_image_with_gemini(file)
+        if error:
+            return respond(f"Extraction failed: {error}", "extraction_failed_card",
+                           code=400 if "key" in error else 500, extracted_data={})
 
-        if ocr_error: 
-            raw_text_safe = raw_text if raw_text else ""
-            logger.warning(f"CardUpload: OCR failed or returned an error. OCR Error: '{ocr_error}', Raw Text (if any): '{raw_text_safe}'")
-            return respond(
-                f"Could not extract text from the card. {ocr_error}", 
-                "extraction_failed_card", 
-                code=400 if "key not configured" in ocr_error else 500, 
-                raw_text=raw_text_safe, 
-                extracted_data={} 
-            )
-        
-        if not raw_text: 
-            logger.info("CardUpload: OCR processed, but no text content was found in the image.")
-            return respond(
-                "OCR processed the image, but no text content was found. Please try a clearer image or enter details manually.",
-                "extraction_failed_card",
-                code=200, 
-                raw_text="",
-                extracted_data={}
-            )
-
-        logger.info(f"CardUpload: OCR successful. Extracted text (first 100 chars): {raw_text[:100]}...")
-
-        # 2. Extract structured entities using Groq
-        extracted_entities, llm_error = extract_entities_with_groq(raw_text)
-
-        if llm_error:
-            logger.error(f"CardUpload: LLM entity extraction failed: {llm_error}")
-            return respond(
-                f"Entity extraction from card's text failed: {llm_error}",
-                "llm_error_card", 
-                code=500,
-                raw_text=raw_text, 
-                extracted_data={}
-            )
-        
         if not extracted_entities or not any(v for v in extracted_entities.values()):
-            logger.info("CardUpload: LLM processed text, but no structured entities were extracted.")
-            return respond(
-                "Could not extract structured details from the card's text. You can review the raw text and add details manually.",
-                "extraction_failed_card", 
-                code=200, 
-                raw_text=raw_text,
-                extracted_data=extracted_entities if extracted_entities else {} 
-            )
+            return respond("No structured details found.", "extraction_failed_card",
+                           code=200, extracted_data=extracted_entities or {})
 
-        logger.info(f"CardUpload: LLM extracted from card: {json.dumps(extracted_entities)}")
-
-        # 3. Find matching customer in DB
+        logger.info(f"CardUpload: Gemini extracted: {json.dumps(extracted_entities)}")
         match_found, existing_customer_data = await find_matching_customer_in_db(extracted_entities)
 
         if match_found and existing_customer_data:
-            logger.info(f"CardUpload: Matched existing customer: {existing_customer_data.get('name')}")
-            return respond(
-                "Card processed. This appears to be an existing customer.",
-                status="existing_customer_card",
-                matched_customer=existing_customer_data,
-                extracted_data=extracted_entities,
-                raw_text=raw_text
-            )
+            logger.info(f"CardUpload: Matched existing: {existing_customer_data.get('name')}")
+            return respond("Card processed. Appears to be existing customer.", "existing_customer_card",
+                           matched_customer=existing_customer_data, extracted_data=extracted_entities)
         else:
-            logger.info("CardUpload: No match found for extracted details, treating as new potential customer.")
-            return respond(
-                "Card processed. Details extracted for a new potential customer. Please review and confirm.",
-                status="new_customer_card",
-                extracted_data=extracted_entities,
-                raw_text=raw_text,
-                matched_customer=None 
-            )
-
-    except Exception as e: 
-        logger.error(f"CardUpload: Unexpected error in /api/upload-card route: {e}", exc_info=True)
-        # Use the initialized or potentially populated variables for raw_text and extracted_entities
-        return respond(
-            f"A critical error occurred while processing the card: {str(e)}",
-            "error", 
-            500,
-            raw_text=raw_text, 
-            extracted_data=extracted_entities
-        )
+            logger.info("CardUpload: No match, new potential customer.")
+            return respond("Card processed. Extracted new details. Review & confirm.", "new_customer_card",
+                           extracted_data=extracted_entities, matched_customer=None)
+    except Exception as e:
+        logger.error(f"CardUpload: Unexpected error: {e}", exc_info=True)
+        return respond(f"Critical error processing card: {str(e)}", "error", 500,
+                       extracted_data={})
 
 @app.route('/api/customers', methods=['POST'])
 async def add_new_customer_route():
@@ -702,46 +615,37 @@ async def add_new_customer_route():
         return respond("Request must be JSON", "error", 415)
     
     customer_data_from_frontend = request.json
-    if not customer_data_from_frontend: 
-        return respond("No customer data provided in the request.", "error", 400)
+    if not customer_data_from_frontend:
+        return respond("No customer data provided.", "error", 400)
 
-    logger.info(f"AddCustomerRoute: Received data for new customer: {json.dumps(customer_data_from_frontend)}")
-    
+    logger.info(f"AddCustomerRoute: Data: {json.dumps(customer_data_from_frontend)}")
     try:
         add_result = await add_customer_to_db(customer_data_from_frontend)
-        
         if add_result["status"] == "success":
-            return respond(
-                add_result["message"], 
-                status="success", 
-                code=201, 
-                customer_data=add_result.get("customer_data")
-            )
+            return respond(add_result["message"], status="success", code=201, customer_data=add_result.get("customer_data"))
         else:
-            error_code = 409 if "already exists" in add_result["message"].lower() else 400 
+            error_code = 409 if "already exists" in add_result["message"].lower() else 400
             return respond(add_result["message"], status="error", code=error_code)
-            
     except Exception as e:
-        logger.error(f"AddCustomerRoute: Critical error calling add_customer_to_db: {e}", exc_info=True)
-        return respond("A server error occurred while trying to add the customer.", "error", 500)
+        logger.error(f"AddCustomerRoute: Critical error: {e}", exc_info=True)
+        return respond("Server error adding customer.", "error", 500)
 
 @app.route('/api/customers', methods=['GET'])
 async def get_customers_route():
-    query = request.args.get('query') 
+    query = request.args.get('query', '').strip()
     
     try:
         if query:
             logger.info(f"GetCustomersRoute: Searching customers with query: '{query}'")
-            customers = await search_customers_in_db(query)
+            customers = await search_customers_in_db(query, for_chat=False)
             return respond(f"Found {len(customers)} customers matching query.", "success", customers=customers)
         else:
-            logger.info("GetCustomersRoute: Fetching all customers (no query specified).")
-            customers = get_all_customers() 
+            logger.info("GetCustomersRoute: Fetching all customers.")
+            customers = get_all_customers()
             return respond(f"Retrieved {len(customers)} customers.", "success", customers=customers)
-            
     except Exception as e:
-        logger.error(f"GetCustomersRoute: Error during customer retrieval/search: {e}", exc_info=True)
-        return respond("Failed to retrieve or search customers due to a server error.", "error", 500)
+        logger.error(f"GetCustomersRoute: Error: {e}", exc_info=True)
+        return respond("Failed to retrieve/search customers.", "error", 500)
 
 @app.route('/health', methods=['GET'])
 async def health_check_route():
@@ -750,29 +654,27 @@ async def health_check_route():
         "api_status": "running",
         "supabase_client": "initialized" if supabase else "not_initialized",
         "groq_client": "initialized" if groq_client else "not_initialized",
-        "nanonets_api_key": "configured" if NANONETS_API_KEY else "not_configured"
+        "gemini_client": "configured" if genai else "not_configured"
     }
-
     if supabase:
         try:
             response = supabase.table('customers').select('id', count='exact').limit(0).execute()
-            
-            if hasattr(response, 'error') and response.error: 
+            if hasattr(response, 'error') and response.error:
                 logger.error(f"HealthCheck: Supabase query error: {response.error}")
                 services["supabase_db_connection"] = f"error ({str(response.error.message)[:50]}...)"
-                status = "degraded" 
-            elif response.count is not None: 
-                 services["supabase_db_connection"] = f"connected (found {response.count} customers table entries)"
-            else: 
-                logger.warning(f"HealthCheck: Supabase count query returned unexpected response: {response}")
-                services["supabase_db_connection"] = "query_issue_unexpected_response"
+                status = "degraded"
+            elif response.count is not None:
+                services["supabase_db_connection"] = f"connected (table 'customers' accessible, count={response.count})"
+            else:
+                logger.warning(f"HealthCheck: Supabase count query returned an unexpected response structure: {response}")
+                services["supabase_db_connection"] = "query_issue_unexpected_response_structure"
                 status = "degraded"
         except Exception as e:
             logger.error(f"HealthCheck: Supabase connection exception: {e}")
             services["supabase_db_connection"] = f"exception ({str(e)[:50]}...)"
             status = "degraded"
     else:
-        status = "degraded" 
+        status = "degraded"
         
     return respond(f"Service health status: {status}.", status, code=200 if status=="ok" else 503, services=services)
 
@@ -781,14 +683,14 @@ asgi_app = WsgiToAsgi(app)
 
 if __name__ == '__main__':
     import uvicorn
-    port = int(os.environ.get("PORT", 5200)) 
+    port = int(os.environ.get("PORT", 5200))
     should_reload = os.getenv("FLASK_ENV", "production").lower() == "development"
     
     logger.info(f"Starting Uvicorn server on http://0.0.0.0:{port} (Reload: {should_reload})")
     uvicorn.run(
-        "__main__:asgi_app", # Changed from "back:asgi_app" to "__main__:asgi_app" if running this file directly
-        host="0.0.0.0", 
-        port=port, 
+        "__main__:asgi_app",
+        host="0.0.0.0",
+        port=port,
         reload=should_reload,
-        log_level="debug" if should_reload else "info" 
+        log_level="debug" if should_reload else "info"
     )
