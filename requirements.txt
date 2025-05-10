@@ -9,3 +9,4 @@ python-Levenshtein
 uvicorn[standard]
 supabase
 google-generativeai
+Pillow
